@@ -14,17 +14,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import os
-from unittest.mock import AsyncMock, patch
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # 确保 1-1-assignment 目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_CONFIGS, render_prompt, calculate_cost
+from config import MODEL_CONFIGS, ModelConfig, render_prompt, calculate_cost
 from models import (
     CallTrace,
     GatewayError,
@@ -35,6 +37,11 @@ from models import (
     ProviderResponse,
     Role,
     Usage,
+)
+from provider import (
+    AnthropicProvider,
+    OpenAICompatibleProvider,
+    create_provider,
 )
 
 
@@ -327,7 +334,7 @@ class TestGatewayLogic:
             model="gpt-4o-mini",
         )
 
-        async def mock_complete(messages, response_schema=None, timeout_seconds=30):
+        async def mock_complete(messages, response_schema=None, timeout_seconds=30, max_tokens=None):
             nonlocal call_count
             call_count += 1
             # 前 2 次调用（主模型）超时，后面（备用模型）正常返回
@@ -421,7 +428,7 @@ class TestStreaming:
 
         _traces.clear()
 
-        async def fake_stream(messages, timeout_seconds=30):
+        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
             # 模拟文本块
             for chunk in ["你好", "！", "我是", "AI", "助手。"]:
                 yield ProviderResponse(
@@ -466,6 +473,421 @@ class TestStreaming:
 
         with pytest.raises(GatewayError, match="model_not_found"):
             validate_model_chain("nonexistent-model")
+
+
+# ──────────────────────────────────────────────
+# 测试：Anthropic 协议适配器
+# ──────────────────────────────────────────────
+
+class TestAnthropicProvider:
+    """Anthropic Messages 协议 Mock 测试。"""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_complete(self):
+        """非流式调用：验证 system 提取、max_tokens 传参、响应解析。"""
+        config = MODEL_CONFIGS["anthropic-claude"]
+        provider = AnthropicProvider(config)
+
+        # Mock Anthropic 响应对象
+        fake_msg = type("FakeMsg", (), {
+            "content": [type("FakeBlock", (), {"type": "text", "text": "Hello from Claude"})()],
+            "model": "claude-sonnet-4-6",
+            "usage": type("FakeUsage", (), {
+                "input_tokens": 15, "output_tokens": 25,
+            })(),
+        })()
+
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(return_value=fake_msg)
+        provider._client = fake_client
+
+        messages = [
+            Message(role=Role.SYSTEM, content="你是助手"),
+            Message(role=Role.USER, content="你好"),
+        ]
+        result = await provider.complete(messages)
+
+        assert result.content == "Hello from Claude"
+        assert result.input_tokens == 15
+        assert result.output_tokens == 25
+        assert result.total_tokens == 40
+
+        # 验证 system 被提取为顶层参数，不在 messages 中
+        call_kwargs = fake_client.messages.create.call_args.kwargs
+        assert call_kwargs["system"] == "你是助手"
+        assert all(m["role"] != "system" for m in call_kwargs["messages"])
+        assert call_kwargs["max_tokens"] == 4096  # PROTOCOL_DEFAULT_MAX_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_anthropic_stream(self):
+        """流式调用：验证 text 事件 → text_delta 映射 + usage 收集。"""
+        config = MODEL_CONFIGS["anthropic-claude"]
+        provider = AnthropicProvider(config)
+
+        # 构造 Mock 流事件
+        text_event_1 = type("E", (), {"type": "text", "text": "你好"})()
+        text_event_2 = type("E", (), {"type": "text", "text": "世界"})()
+
+        final_msg = type("FakeMsg", (), {
+            "model": "claude-sonnet-4-6",
+            "usage": type("FakeUsage", (), {
+                "input_tokens": 8, "output_tokens": 4,
+            })(),
+        })()
+
+        async def mock_events():
+            yield text_event_1
+            yield text_event_2
+
+        class FakeStream:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def __aiter__(self):
+                return mock_events()
+            async def get_final_message(self):
+                return final_msg
+
+        fake_client = AsyncMock()
+        fake_client.messages.stream = MagicMock(return_value=FakeStream())
+        provider._client = fake_client
+
+        messages = [Message(role=Role.USER, content="说两个字")]
+        results = []
+        async for pr in provider.stream(messages):
+            results.append(pr)
+
+        # 2 个 text 事件 + 1 个 usage chunk
+        assert len(results) == 3
+        assert results[0].text_delta == "你好"
+        assert results[1].text_delta == "世界"
+        assert results[2].is_usage_chunk is True
+        assert results[2].input_tokens == 8
+        assert results[2].output_tokens == 4
+
+    @pytest.mark.asyncio
+    async def test_anthropic_schema_injection(self):
+        """结构化输出：Schema 应注入 system 参数（Anthropic 无原生 JSON mode）。"""
+        config = MODEL_CONFIGS["anthropic-claude"]
+        provider = AnthropicProvider(config)
+
+        fake_msg = type("FakeMsg", (), {
+            "content": [type("FakeBlock", (), {"type": "text", "text": '{"ok": true}'})()],
+            "model": "claude-sonnet-4-6",
+            "usage": type("FakeUsage", (), {
+                "input_tokens": 10, "output_tokens": 5,
+            })(),
+        })()
+
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(return_value=fake_msg)
+        provider._client = fake_client
+
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+        messages = [Message(role=Role.USER, content="test")]
+        await provider.complete(messages, response_schema=schema)
+
+        call_kwargs = fake_client.messages.create.call_args.kwargs
+        # 无原始 system 消息时，应自动创建并注入 Schema
+        assert "system" in call_kwargs
+        assert "JSON Schema" in call_kwargs["system"]
+
+    def test_create_provider_factory(self):
+        """工厂函数应根据 protocol 返回正确的适配器类型。"""
+        openai_config = ModelConfig(
+            provider_model="test", base_url="http://test", api_key_env="K",
+        )
+        anthropic_config = ModelConfig(
+            provider_model="test", base_url="http://test", api_key_env="K",
+            protocol="anthropic",
+        )
+
+        p1 = create_provider(openai_config)
+        p2 = create_provider(anthropic_config)
+
+        assert isinstance(p1, OpenAICompatibleProvider)
+        assert isinstance(p2, AnthropicProvider)
+
+
+# ──────────────────────────────────────────────
+# 测试：TTFT 度量
+# ──────────────────────────────────────────────
+
+class TestTTFT:
+    """TTFT（首 Token 时间）度量测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_ttft_recorded(self):
+        """流式调用应记录 ttft_ms > 0。"""
+        from gateway import stream_with_fallback, _traces
+
+        _traces.clear()
+
+        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
+            await asyncio.sleep(0.05)  # 模拟首 Token 延迟
+            yield ProviderResponse(text_delta="你好", model="deepseek-chat")
+            yield ProviderResponse(text_delta="世界", model="deepseek-chat")
+            yield ProviderResponse(
+                text_delta="", model="deepseek-chat",
+                input_tokens=5, output_tokens=4, total_tokens=9,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            async for _ in stream_with_fallback(req):
+                pass
+
+            assert len(_traces) == 1
+            assert _traces[0].ttft_ms is not None
+            assert _traces[0].ttft_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_stream_ttft_in_completed_event(self):
+        """response.completed SSE 事件应包含 ttft_ms。"""
+        from gateway import stream_with_fallback
+
+        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
+            yield ProviderResponse(text_delta="A", model="m")
+            yield ProviderResponse(
+                text_delta="", model="m",
+                input_tokens=1, output_tokens=1, total_tokens=2,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            completed = [e for e in events if e["type"] == "response.completed"]
+            assert len(completed) == 1
+            assert "ttft_ms" in completed[0]
+            assert completed[0]["ttft_ms"] is not None
+
+    @pytest.mark.asyncio
+    async def test_non_stream_ttft_is_none(self):
+        """非流式调用的 ttft_ms 应为 None。"""
+        from gateway import call_with_fallback
+
+        fake_response = make_fake_response()
+        with patch(
+            "provider.OpenAICompatibleProvider.complete",
+            new_callable=AsyncMock,
+            return_value=fake_response,
+        ):
+            req = make_request()
+            resp = await call_with_fallback(req)
+            assert resp.ttft_ms is None
+
+
+# ──────────────────────────────────────────────
+# 测试：按模型限流 429
+# ──────────────────────────────────────────────
+
+class TestRateLimiting:
+    """线程安全按模型限流测试。"""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_exceeded(self):
+        """rpm=2 时第 3 次调用应抛出 rate_limited。"""
+        from gateway import _ModelRateLimiter
+
+        limiter = _ModelRateLimiter()
+        await limiter.acquire("test-rl-model", 2)
+        await limiter.acquire("test-rl-model", 2)
+
+        with pytest.raises(GatewayError, match="rate_limited"):
+            await limiter.acquire("test-rl-model", 2)
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_per_model_isolation(self):
+        """模型 A 触发限流不影响模型 B。"""
+        from gateway import _ModelRateLimiter
+
+        limiter = _ModelRateLimiter()
+        await limiter.acquire("model-A", 1)
+
+        with pytest.raises(GatewayError, match="rate_limited"):
+            await limiter.acquire("model-A", 1)
+
+        # 模型 B 不受影响
+        await limiter.acquire("model-B", 1)  # 不应抛出
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_sliding_window(self):
+        """窗口滑过后新请求应可通过。"""
+        from gateway import _ModelRateLimiter
+
+        limiter = _ModelRateLimiter()
+        await limiter.acquire("test-sw-model", 1)
+
+        with pytest.raises(GatewayError, match="rate_limited"):
+            await limiter.acquire("test-sw-model", 1)
+
+        # 模拟时间前进 61 秒，窗口外记录应被清除
+        original_now = time.monotonic
+        time.monotonic = lambda: original_now() + 61.0
+        try:
+            await limiter.acquire("test-sw-model", 1)  # 不应抛出
+        finally:
+            time.monotonic = original_now
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_zero_means_unlimited(self):
+        """rpm=0 表示不限制。"""
+        from gateway import _ModelRateLimiter
+
+        limiter = _ModelRateLimiter()
+        for _ in range(100):
+            await limiter.acquire("test-unlimited", 0)
+
+
+# ──────────────────────────────────────────────
+# 测试：模型隔离
+# ──────────────────────────────────────────────
+
+class TestModelIsolation:
+    """验证不同协议模型使用正确的适配器。"""
+
+    def test_openai_model_uses_openai_provider(self):
+        """OpenAI 协议模型应使用 OpenAICompatibleProvider。"""
+        config = MODEL_CONFIGS["general-primary"]
+        provider = create_provider(config)
+        assert isinstance(provider, OpenAICompatibleProvider)
+
+    def test_anthropic_model_uses_anthropic_provider(self):
+        """Anthropic 协议模型应使用 AnthropicProvider。"""
+        config = MODEL_CONFIGS["anthropic-claude"]
+        provider = create_provider(config)
+        assert isinstance(provider, AnthropicProvider)
+
+
+# ──────────────────────────────────────────────
+# 测试：HTTP 状态码契约
+# ──────────────────────────────────────────────
+
+class TestHTTPStatusContract:
+    """HTTP 状态码映射契约测试。
+
+    确保 GatewayError.http_status 映射稳定，
+    防止重构翻转映射条件或删掉 pre-flight 调用时测试能捕获。
+    """
+
+    def test_gateway_error_rate_limited_429(self):
+        """rate_limited 错误码应映射为 HTTP 429。"""
+        exc = GatewayError("rate_limited", "test")
+        assert exc.http_status == 429
+
+    def test_gateway_error_auth_401(self):
+        """provider_auth_error 应映射为 HTTP 401。"""
+        exc = GatewayError("provider_auth_error", "test")
+        assert exc.http_status == 401
+
+    def test_gateway_error_default_422(self):
+        """未注册错误码应默认 HTTP 422。"""
+        exc = GatewayError("structured_output_invalid", "test")
+        assert exc.http_status == 422
+
+    def test_gateway_error_custom_status(self):
+        """显式 http_status 应覆盖默认映射。"""
+        exc = GatewayError("custom_error", "test", http_status=503)
+        assert exc.http_status == 503
+
+    @pytest.mark.asyncio
+    async def test_validate_rate_limit_raises_429(self):
+        """validate_rate_limit 在所有模型超限时抛出 rate_limited (429)。"""
+        from gateway import validate_rate_limit, _ModelRateLimiter
+        import gateway as gw
+
+        # 临时给 fallback 链中所有模型设置限流，避免 backup 的 rpm=0 无条件放行
+        rl_config_primary = ModelConfig(
+            provider_model="test-p", base_url="http://test", api_key_env="K",
+            rate_limit_rpm=1,
+        )
+        rl_config_backup = ModelConfig(
+            provider_model="test-b", base_url="http://test", api_key_env="K",
+            rate_limit_rpm=1,
+        )
+        original_primary = MODEL_CONFIGS["general-primary"]
+        original_backup = MODEL_CONFIGS["general-backup"]
+        MODEL_CONFIGS["general-primary"] = rl_config_primary
+        MODEL_CONFIGS["general-backup"] = rl_config_backup
+        # 临时替换限流器实例避免污染全局状态
+        original_limiter = gw._rate_limiter
+        gw._rate_limiter = _ModelRateLimiter()
+        try:
+            # 填满两个模型的配额
+            await gw._rate_limiter.acquire("general-primary", 1)
+            await gw._rate_limiter.acquire("general-backup", 1)
+            with pytest.raises(GatewayError) as exc_info:
+                validate_rate_limit("general-primary")
+            assert exc_info.value.error_code == "rate_limited"
+            assert exc_info.value.http_status == 429
+        finally:
+            MODEL_CONFIGS["general-primary"] = original_primary
+            MODEL_CONFIGS["general-backup"] = original_backup
+            gw._rate_limiter = original_limiter
+
+    @pytest.mark.asyncio
+    async def test_validate_rate_limit_passes_when_under_limit(self):
+        """validate_rate_limit 未超限时应正常通过。"""
+        from gateway import validate_rate_limit
+        validate_rate_limit("general-primary")  # rpm=0 → 不限制
+
+    @pytest.mark.asyncio
+    async def test_streaming_provider_auth_error_event(self):
+        """流式调用认证失败应产生 provider_auth_error SSE 事件。"""
+        from gateway import stream_with_fallback
+        from openai import AuthenticationError
+
+        auth_error = AuthenticationError(
+            message="Invalid API key",
+            response=MagicMock(),
+            body=None,
+        )
+
+        # AsyncMock 无法正确通过 async for 传播异常，
+        # 需要用 async generator 函数 + yield 哨兵
+        async def fake_auth_error_stream(*args, **kwargs):
+            raise auth_error
+            yield  # pragma: no cover — 使其成为 async generator
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_auth_error_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            error_events = [e for e in events if e["type"] == "error"]
+            assert len(error_events) == 1
+            assert error_events[0]["error_code"] == "provider_auth_error"
+
+    @pytest.mark.asyncio
+    async def test_would_accept_does_not_consume_quota(self):
+        """would_accept 只读检查，不应修改窗口内容。"""
+        from gateway import _ModelRateLimiter
+
+        limiter = _ModelRateLimiter()
+        await limiter.acquire("wa-test", 2)
+        # would_accept 多次调用不应消费配额
+        assert limiter.would_accept("wa-test", 2) is True
+        assert limiter.would_accept("wa-test", 2) is True
+        # 再 acquire 一次，还有 1 个配额
+        await limiter.acquire("wa-test", 2)
+        # 现在满了
+        assert limiter.would_accept("wa-test", 2) is False
 
 
 if __name__ == "__main__":

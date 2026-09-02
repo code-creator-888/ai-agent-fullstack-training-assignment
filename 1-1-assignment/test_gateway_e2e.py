@@ -42,6 +42,14 @@ skip_no_key = pytest.mark.skipif(
     reason="需要设置 DEEPSEEK_API_KEY 环境变量",
 )
 
+HAS_ANTHROPIC_KEY = bool(
+    os.getenv("ANTHROPIC_API_KEY", "").startswith("sk-ant-")
+)
+skip_no_anthropic_key = pytest.mark.skipif(
+    not HAS_ANTHROPIC_KEY,
+    reason="需要设置 ANTHROPIC_API_KEY 环境变量（必须以 sk-ant- 开头）",
+)
+
 
 # ──────────────────────────────────────────────
 # 辅助工具
@@ -170,6 +178,56 @@ class TestE2EStreaming:
         # 流式审计
         assert len(_traces) == 1
         assert _traces[0].status == "success"
+
+
+@skip_no_anthropic_key
+class TestE2EAnthropic:
+    """Anthropic 协议端到端测试。"""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_basic_call(self):
+        """Anthropic 模型基本非流式调用。"""
+        from gateway import call_with_fallback, _traces
+
+        _traces.clear()
+        req = LLMRequest(
+            model="anthropic-claude",
+            messages=[Message(role=Role.USER, content="用一句话介绍Python")],
+        )
+        resp = await call_with_fallback(req)
+
+        assert resp.content
+        assert resp.model == "anthropic-claude"
+        assert resp.usage.total_tokens > 0
+
+        # 审计记录
+        assert len(_traces) == 1
+        assert _traces[0].status == "success"
+        assert _traces[0].requested_model == "anthropic-claude"
+
+
+@skip_no_key
+class TestE2ETTFT:
+    """TTFT 度量端到端测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_ttft_e2e(self):
+        """真实 API 流式调用应记录 ttft_ms > 0。"""
+        from gateway import stream_with_fallback, _traces
+
+        _traces.clear()
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="说一个字")],
+            stream=True,
+        )
+
+        async for _ in stream_with_fallback(req):
+            pass
+
+        assert len(_traces) == 1
+        assert _traces[0].ttft_ms is not None
+        assert _traces[0].ttft_ms > 0
 
 
 # ──────────────────────────────────────────────

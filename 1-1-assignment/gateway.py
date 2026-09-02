@@ -1,4 +1,4 @@
-"""LLM Gateway 核心：主备切换、重试、结构化校验、调用审计。
+"""LLM Gateway 核心：主备切换、重试、结构化校验、调用审计、限流。
 
 这是整个网关的中枢，协调 provider、config、models 各层。
 """
@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import threading
 import time
+from collections import deque
 from typing import AsyncIterator
 
 import jsonschema
@@ -30,7 +32,11 @@ from models import (
     Usage,
     new_request_id,
 )
-from provider import RETRYABLE_EXCEPTIONS, OpenAICompatibleProvider
+from provider import (
+    NON_RETRYABLE_PROVIDER_EXCEPTIONS,
+    RETRYABLE_EXCEPTIONS,
+    create_provider,
+)
 
 
 # ──────────────────────────────────────────────
@@ -51,6 +57,74 @@ def _record_trace(trace: CallTrace) -> None:
 
 
 # ──────────────────────────────────────────────
+# 按模型限流（线程安全滑动窗口）
+# ──────────────────────────────────────────────
+
+class _ModelRateLimiter:
+    """线程安全的按模型滑动窗口限流器。
+
+    使用 threading.Lock 保护懒初始化（跨 event loop 安全），
+    asyncio.Lock 保护每模型的窗口操作。
+    """
+
+    def __init__(self) -> None:
+        self._init_lock = threading.Lock()
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._windows: dict[str, deque[float]] = {}
+
+    async def acquire(self, model: str, rpm: int) -> None:
+        """尝试获取一次请求许可。
+
+        Args:
+            model: 平台模型名
+            rpm: 每分钟请求上限（0 表示不限制）
+
+        Raises:
+            GatewayError: 超过速率限制时抛出 rate_limited
+        """
+        if rpm <= 0:
+            return
+        # threading.Lock 保护懒初始化，跨 event loop 安全
+        if model not in self._locks:
+            with self._init_lock:
+                if model not in self._locks:
+                    self._locks[model] = asyncio.Lock()
+                    self._windows[model] = deque()
+        async with self._locks[model]:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            window = self._windows[model]
+            while window and window[0] < cutoff:
+                window.popleft()
+            if len(window) >= rpm:
+                raise GatewayError(
+                    "rate_limited",
+                    f"模型 '{model}' 已达速率限制 ({rpm} req/min)",
+                )
+            window.append(now)
+
+    def would_accept(self, model: str, rpm: int) -> bool:
+        """只读检查模型是否可接受请求（不消费配额）。
+
+        与 acquire() 使用相同的滑动窗口逻辑，但不修改窗口内容。
+        供 app 层 pre-flight 预检使用。
+
+        Returns:
+            True 表示未超限（或 rpm<=0 不限制），False 表示已超限
+        """
+        if rpm <= 0:
+            return True
+        now = time.monotonic()
+        cutoff = now - 60.0
+        window = self._windows.get(model, deque())
+        active = sum(1 for t in window if t >= cutoff)
+        return active < rpm
+
+
+_rate_limiter = _ModelRateLimiter()  # 模块级单例
+
+
+# ──────────────────────────────────────────────
 # 模型链校验（供流式端点在返回 StreamingResponse 前调用）
 # ──────────────────────────────────────────────
 
@@ -64,6 +138,33 @@ def validate_model_chain(requested_model: str) -> None:
     for model in chain:
         if model not in MODEL_CONFIGS:
             raise GatewayError("model_not_found", f"模型 '{model}' 不在白名单中")
+
+
+def validate_rate_limit(requested_model: str) -> None:
+    """在返回 StreamingResponse 之前预检限流。
+
+    与 validate_model_chain 同属 app 层 pre-flight 检查，
+    确保 rate_limited 能被 exception_handler 捕获为 429 JSON
+    （而非 SSE 流内嵌 error 事件）。
+    检查 fallback 链中至少有一个模型未超限。
+    使用 would_accept() 公共方法，不直接访问限流器内部字段。
+    """
+    chain = _build_fallback_chain(requested_model)
+    last_error: GatewayError | None = None
+    for model in chain:
+        if model not in MODEL_CONFIGS:
+            continue
+        config = MODEL_CONFIGS[model]
+        if _rate_limiter.would_accept(model, config.rate_limit_rpm):
+            return  # 至少有一个模型未超限
+        # 记录此模型的限流错误（用于最终抛出）
+        if config.rate_limit_rpm > 0:
+            last_error = GatewayError(
+                "rate_limited",
+                f"模型 '{model}' 已达速率限制 ({config.rate_limit_rpm} req/min)",
+            )
+    if last_error:
+        raise last_error
 
 
 # ──────────────────────────────────────────────
@@ -85,9 +186,7 @@ def _apply_prompt(request: LLMRequest) -> list[Message]:
         variables=request.prompt.variables,
     )
 
-    # 模板渲染的 system 消息放在最前面
     template_msg = Message(role=Role.SYSTEM, content=system_content)
-    # 保留用户原有的 system 消息，追加在后面
     existing_system = [m for m in request.messages if m.role == Role.SYSTEM]
     non_system = [m for m in request.messages if m.role != Role.SYSTEM]
     return [template_msg] + existing_system + non_system
@@ -154,9 +253,10 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
 
     流程：
     1. 按 fallback 链依次尝试每个模型
-    2. 每个模型最多重试 1 次（指数退避）
-    3. 可重试异常等待后重试，不可重试异常直接抛出
-    4. 全部失败抛出 model_unavailable
+    2. 限流检查在 try 块内，超限视同可重试异常（切换到下一个模型）
+    3. 每个模型最多重试 1 次（指数退避）
+    4. 可重试异常等待后重试，不可重试异常直接抛出
+    5. 全部失败抛出 model_unavailable
     """
     request_id = new_request_id()
     start_time = time.monotonic()
@@ -173,15 +273,20 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
             raise GatewayError("model_not_found", f"模型 '{platform_model}' 不在白名单中")
 
         config = MODEL_CONFIGS[platform_model]
-        provider = OpenAICompatibleProvider(config)
+        provider = create_provider(config)
 
         for attempt in range(MAX_RETRIES_PER_MODEL):
             total_attempts += 1
             try:
+                # 限流在 try 内：超限 → GatewayError("rate_limited")
+                # → 被下方 except GatewayError 捕获 → continue 切换模型
+                await _rate_limiter.acquire(platform_model, config.rate_limit_rpm)
+
                 raw: ProviderResponse = await provider.complete(
                     messages=messages,
                     response_schema=request.response_schema,
                     timeout_seconds=request.timeout_seconds,
+                    max_tokens=request.max_tokens,
                 )
 
                 latency_ms = int((time.monotonic() - start_time) * 1000)
@@ -191,14 +296,12 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
                     total_tokens=raw.total_tokens,
                 )
 
-                # 结构化输出校验
                 parsed = None
                 if request.response_schema is not None:
                     parsed = _validate_structured_output(
                         raw.content, request.response_schema
                     )
 
-                # 审计记录
                 cost = calculate_cost(
                     config.provider_model, usage.input_tokens, usage.output_tokens
                 )
@@ -217,7 +320,6 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
                 )
                 _record_trace(trace)
 
-                # 返回平台模型名，不暴露供应商名
                 return LLMResponse(
                     request_id=request_id,
                     model=platform_model,
@@ -234,8 +336,17 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
                     await asyncio.sleep(_retry_delay(attempt))
                 continue  # 尝试重试或切换模型
 
-            except GatewayError:
-                raise  # 请求不合法，直接抛出
+            except NON_RETRYABLE_PROVIDER_EXCEPTIONS as e:
+                raise GatewayError("provider_auth_error", str(e)) from e
+
+            except GatewayError as e:
+                # rate_limited 可切换到下一个模型；其他错误（如
+                # structured_output_invalid / gateway_misconfigured）
+                # 不应 fallback — 同一模型重试不会改变结果
+                if e.error_code in ("rate_limited",):
+                    last_error = e
+                    continue
+                raise
 
             except Exception as e:
                 raise GatewayError("unknown_error", str(e)) from e
@@ -273,6 +384,9 @@ async def stream_with_fallback(
     - {"type": "content.delta", "delta": "..."}   文本块
     - {"type": "response.completed", "model": "...", "usage": {...}} 完成事件
     - {"type": "error", "error_code": "...", "message": "..."} 错误事件
+
+    注意：限流预检在 app 层 validate_rate_limit() 完成（429 JSON），
+    此处仅做兜底 acquire（确保计数准确）。
     """
     request_id = new_request_id()
     start_time = time.monotonic()
@@ -284,8 +398,6 @@ async def stream_with_fallback(
 
     for platform_model in model_chain:
         if platform_model not in MODEL_CONFIGS:
-            # 正常流程不会走到这里（app 层 validate_model_chain 已拦截）。
-            # 仅当绕过 app 层直接调用 stream_with_fallback 时才会触发。
             yield {
                 "type": "error",
                 "error_code": "model_not_found",
@@ -295,24 +407,33 @@ async def stream_with_fallback(
             return
 
         config = MODEL_CONFIGS[platform_model]
-        provider = OpenAICompatibleProvider(config)
+        provider = create_provider(config)
         emitted = False
         stream_usage: Usage | None = None
+        ttft_ms: int | None = None
+
+        # 限流计数（app 层已预检，此处仅确保计数）
+        try:
+            await _rate_limiter.acquire(platform_model, config.rate_limit_rpm)
+        except GatewayError:
+            # 预检已通过但并发导致超限 → 尝试下一个模型
+            continue
 
         try:
             async for pr in provider.stream(
                 messages=messages,
                 timeout_seconds=request.timeout_seconds,
+                max_tokens=request.max_tokens,
             ):
-                # 文本块：转发给客户端
                 if pr.text_delta:
+                    if ttft_ms is None:
+                        ttft_ms = int((time.monotonic() - start_time) * 1000)
                     emitted = True
                     yield {
                         "type": "content.delta",
                         "delta": pr.text_delta,
                         "request_id": request_id,
                     }
-                # usage chunk：通过显式标志识别，不依赖 token 数推断
                 if pr.is_usage_chunk:
                     stream_usage = Usage(
                         input_tokens=pr.input_tokens,
@@ -320,7 +441,7 @@ async def stream_with_fallback(
                         total_tokens=pr.total_tokens,
                     )
 
-            # 流正常结束：记录审计
+            # 流正常结束
             latency_ms = int((time.monotonic() - start_time) * 1000)
             usage = stream_usage or Usage()
             cost = calculate_cost(
@@ -336,6 +457,7 @@ async def stream_with_fallback(
                 output_tokens=usage.output_tokens,
                 cost_usd=cost,
                 latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
                 attempts=1,
                 status="success",
             )
@@ -346,12 +468,12 @@ async def stream_with_fallback(
                 "model": platform_model,
                 "request_id": request_id,
                 "usage": usage.model_dump(),
+                "ttft_ms": ttft_ms,
             }
             return
 
         except RETRYABLE_EXCEPTIONS as e:
             if emitted:
-                # 已发送部分内容，不再切换，直接报错
                 latency_ms = int((time.monotonic() - start_time) * 1000)
                 trace = CallTrace(
                     request_id=request_id,
@@ -360,6 +482,7 @@ async def stream_with_fallback(
                     prompt_name=prompt_name,
                     prompt_version=prompt_version,
                     latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
                     attempts=1,
                     status="error",
                     error_code="stream_interrupted",
@@ -372,8 +495,16 @@ async def stream_with_fallback(
                     "request_id": request_id,
                 }
                 return
-            # 流未开始，尝试下一个模型
-            continue
+            continue  # 流未开始，尝试下一个模型
+
+        except NON_RETRYABLE_PROVIDER_EXCEPTIONS as e:
+            yield {
+                "type": "error",
+                "error_code": "provider_auth_error",
+                "message": str(e),
+                "request_id": request_id,
+            }
+            return
 
         except GatewayError as e:
             yield {

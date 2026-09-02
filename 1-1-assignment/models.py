@@ -68,6 +68,7 @@ class LLMRequest(BaseModel):
     stream: bool = False                    # 是否流式
     response_schema: Optional[dict] = None  # 结构化输出 JSON Schema
     timeout_seconds: float = 30             # 超时时间
+    max_tokens: Optional[int] = None         # 最大输出 Token 数（None 使用模型配置默认值）
     prompt: Optional[PromptSelection] = None  # Prompt 模板选择
 
     @model_validator(mode="after")
@@ -91,6 +92,7 @@ class LLMResponse(BaseModel):
     usage: Usage                    # Token 用量
     latency_ms: int                 # 请求延迟（毫秒）
     attempts: int                   # 尝试次数（含重试）
+    ttft_ms: Optional[int] = None   # 流式首 Token 时间（毫秒），非流式为 None
 
 
 # ──────────────────────────────────────────────
@@ -113,6 +115,7 @@ class CallTrace(BaseModel):
     output_tokens: int = 0
     cost_usd: float = 0.0                   # 按 PRICE_PER_MILLION 自动计算
     latency_ms: int = 0
+    ttft_ms: Optional[int] = None           # 流式首 Token 时间（毫秒），非流式为 None
     attempts: int = 0
     status: str = "success"                 # success / error
     error_code: Optional[str] = None        # 错误码
@@ -123,11 +126,21 @@ class CallTrace(BaseModel):
 # ──────────────────────────────────────────────
 
 class GatewayError(Exception):
-    """网关业务异常基类。"""
+    """网关业务异常基类。
 
-    def __init__(self, error_code: str, message: str):
+    http_status 字段控制 REST 层返回的 HTTP 状态码，
+    默认 422（业务异常），限流为 429，认证失败为 401。
+    """
+
+    _DEFAULT_STATUS: dict[str, int] = {
+        "rate_limited": 429,
+        "provider_auth_error": 401,
+    }
+
+    def __init__(self, error_code: str, message: str, *, http_status: int | None = None):
         self.error_code = error_code
         self.message = message
+        self.http_status = http_status or self._DEFAULT_STATUS.get(error_code, 422)
         super().__init__(f"[{error_code}] {message}")
 
 

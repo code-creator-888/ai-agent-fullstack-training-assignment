@@ -45,7 +45,14 @@ Agent / 客户端
 │  └──────────┘  └───────────┬───────────┘ │
 │                             ▼             │
 │  ┌──────────────────────────────────────┐ │
-│  │   供应商适配器 (OpenAICompatible)    │ │
+│  │   按模型限流 (429 rate_limited)      │ │
+│  │   滑动窗口 + asyncio.Lock           │ │
+│  └──────────────┬───────────────────────┘ │
+│                 ▼                         │
+│  ┌──────────────────────────────────────┐ │
+│  │   供应商适配器工厂 (create_provider) │ │
+│  │   ├─ OpenAICompatibleProvider       │ │
+│  │   └─ AnthropicProvider              │ │
 │  │   complete() / stream()              │ │
 │  └──────────────┬───────────────────────┘ │
 │                 ▼                         │
@@ -56,12 +63,12 @@ Agent / 客户端
 │                 ▼                         │
 │  ┌──────────────────────────────────────┐ │
 │  │  结构化输出校验 (jsonschema)         │ │
-│  │  + 审计记录 (CallTrace)              │ │
+│  │  + TTFT 度量 + 审计记录 (CallTrace)  │ │
 │  └──────────────────────────────────────┘ │
 └──────────────────────────────────────────┘
     │
     ▼
-DeepSeek / OpenAI / 其他兼容供应商
+DeepSeek / OpenAI / Anthropic / 其他兼容供应商
 ```
 
 ### 分层说明
@@ -69,11 +76,11 @@ DeepSeek / OpenAI / 其他兼容供应商
 | 层次 | 文件 | 职责 |
 |------|------|------|
 | **协议层** | `../models.py` | Pydantic 请求/响应模型，`extra="forbid"` 防注入 |
-| **配置层** | `../config.py` | 模型白名单 `MODEL_CONFIGS`、Prompt 模板注册表、价格表 |
-| **适配器层** | `../provider.py` | `OpenAICompatibleProvider`，统一 `complete()` / `stream()` |
-| **网关核心** | `../gateway.py` | 主备切换、重试、结构化校验、审计记录 |
-| **API 层** | `../app.py` | FastAPI REST 端点 |
-| **测试** | `../test_gateway.py` | Mock 测试 + 集成测试 |
+| **配置层** | `../config.py` | 模型白名单 `MODEL_CONFIGS`、Prompt 模板注册表、价格表、限流配置 |
+| **适配器层** | `../provider.py` | `BaseProvider` 抽象 + `OpenAICompatibleProvider` + `AnthropicProvider`，工厂函数 `create_provider()` |
+| **网关核心** | `../gateway.py` | 主备切换、重试、结构化校验、审计记录、TTFT 度量、按模型限流 |
+| **API 层** | `../app.py` | FastAPI REST 端点，429 限流响应映射 |
+| **测试** | `../test_gateway.py` | Mock 测试（45 项） + 集成测试 |
 
 ## 4. 目录结构
 
@@ -153,19 +160,58 @@ MODEL_CONFIGS = {
 
 ### 5.3 供应商适配器 (`../provider.py`)
 
-实现 `OpenAICompatibleProvider`，统一两个核心接口：
+采用 **BaseProvider 抽象基类 + 多协议适配器** 架构，通过 `create_provider()` 工厂函数按 `ModelConfig.protocol` 自动选择适配器：
 
-#### `complete()` — 非流式
+```
+BaseProvider (ABC)
+├── OpenAICompatibleProvider   (protocol="openai")
+└── AnthropicProvider           (protocol="anthropic")
+```
+
+#### OpenAICompatibleProvider
+
+统一两个核心接口：
+
+##### `complete()` — 非流式
 
 - 支持两种结构化输出模式：
   - `json_schema`：使用 `response_format.type = "json_schema"` + `strict=True`
   - `json_object`：使用 `response_format.type = "json_object"` + 在 system prompt 中注入 Schema
 - 密钥通过 `config.api_key_env` 从环境变量读取，缺失时抛出 `gateway_misconfigured` 错误
 
-#### `stream()` — 流式
+##### `stream()` — 流式
 
 - 逐块读取上游响应，yield `delta.content`
 - **流开始后不再切换备用模型**，避免文本重复或断裂
+
+#### AnthropicProvider
+
+适配 Anthropic Messages API，与 OpenAI 协议的关键差异：
+
+| 差异点 | OpenAI 协议 | Anthropic 协议 |
+|---------|------------|----------------|
+| system 消息 | 在 messages 列表中 | 顶层 `system` 参数 |
+| max_tokens | 可选 | **必传**（默认 4096） |
+| 结构化输出 | 原生 json_schema/json_object | 无原生支持，通过 system prompt 注入 |
+| 流式事件 | `choices[0].delta.content` | `event.type == "text"` + `get_final_message()` |
+| SDK | `openai.AsyncOpenAI` | `anthropic.AsyncAnthropic` |
+
+**工厂函数**（带缓存，复用 SDK 连接池）：
+
+```python
+_provider_cache: dict[ModelConfig, BaseProvider] = {}
+
+def create_provider(config: ModelConfig) -> BaseProvider:
+    cached = _provider_cache.get(config)
+    if cached is not None:
+        return cached
+    if config.protocol == "anthropic":
+        provider = AnthropicProvider(config)
+    else:
+        provider = OpenAICompatibleProvider(config)
+    _provider_cache[config] = provider
+    return provider
+```
 
 ### 5.4 主备切换与重试 (`../gateway.py` — `call_with_fallback`)
 
@@ -184,9 +230,9 @@ for model_name in [requested_model, "general-backup"]:
 
 **重试策略**：指数退避 `min(0.1 * 2^attempt, 5.0)` + 随机 jitter，避免所有重试同时打向上游。
 
-**可重试异常**：`APIConnectionError`、`APITimeoutError`、`RateLimitError`、`TimeoutError`、`ConnectionError`
+**可重试异常**：`APIConnectionError`、`APITimeoutError`、`RateLimitError`、`TimeoutError`、`ConnectionError`（覆盖 OpenAI 和 Anthropic 两种协议）
 
-**不可重试异常**：`GatewayError`（请求不合法）、其他未知异常
+**不可重试异常**：`GatewayError`（请求不合法）、`openai.AuthenticationError` / `openai.PermissionDeniedError`、`anthropic.AuthenticationError` / `anthropic.PermissionDeniedError`（认证失败，双协议对称）、其他未知异常
 
 ### 5.5 流式代理 (`stream_with_fallback`)
 
@@ -212,7 +258,7 @@ except:
 - 流开始后出错不再切换模型，因为已向客户端发送部分内容，切换会导致文本断裂
 - 流式调用同样记录 `CallTrace` 审计（含 token 用量、成本、延迟）
 - `response.completed` 事件携带 `usage` 信息
-- 流式端点在返回 `StreamingResponse` 之前调用 `validate_model_chain()` 校验白名单，确保错误被 `exception_handler` 捕获为 422 JSON
+- 流式端点在返回 `StreamingResponse` 之前调用 `validate_model_chain()` 校验白名单（确保 422 JSON）和 `validate_rate_limit()` 预检限流（确保 429 JSON），避免 SSE 流内嵌 error 事件
 
 ### 5.6 结构化输出校验
 
@@ -255,6 +301,7 @@ PROMPT_TEMPLATES = {
 | `input_tokens` / `output_tokens` | Token 用量 |
 | `cost_usd` | 按 `PRICE_PER_MILLION` 自动计算的成本 |
 | `latency_ms` / `attempts` | 延迟和重试次数 |
+| `ttft_ms` | 流式首 Token 时间（毫秒），非流式为 None |
 | `status` / `error_code` | 成功/失败状态 |
 
 **默认不保存模型回答和 Prompt 文本**，只保留元数据，保护隐私。
@@ -265,8 +312,32 @@ PROMPT_TEMPLATES = {
 PRICE_PER_MILLION = {
     "deepseek-chat":       {"input": 0.27, "output": 1.10},
     "gpt-4o-mini":         {"input": 0.15, "output": 0.60},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
 }
 ```
+
+### 5.9 TTFT 度量 (`ttft_ms`)
+
+**Time to First Token**：从请求发出到收到第一个非空文本 delta 的时间（毫秒）。
+
+- 仅在流式调用中有意义，非流式调用 `ttft_ms = None`
+- 在 `stream_with_fallback()` 中记录首个 `pr.text_delta` 非空时的时间戳
+- 写入 `CallTrace.ttft_ms`（审计）和 `response.completed` SSE 事件
+- 流中断场景（`stream_interrupted`）同样记录 ttft_ms
+
+### 5.10 按模型限流 (`_ModelRateLimiter`)
+
+线程安全的滑动窗口限流器，每个平台模型独立计数：
+
+| 特性 | 说明 |
+|------|------|
+| **粒度** | 按平台模型名（如 `general-primary`）独立限流 |
+| **算法** | 60 秒滑动窗口，记录请求时间戳 |
+| **线程安全** | 每个模型独立的 `asyncio.Lock`，并发安全 |
+| **配置** | `ModelConfig.rate_limit_rpm`（0 表示不限制） |
+| **超限响应** | 非流式：在 try 内抛出 `GatewayError("rate_limited")` → fallback 下一模型；流式：app 层 `validate_rate_limit()` pre-flight → **429 JSON** |
+
+限流在 provider 调用之前执行，避免重试消耗配额。
 
 ## 6. REST API (`../app.py`)
 
@@ -404,6 +475,21 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 因为使用 OpenAI 兼容协议，无需新增适配器代码。
 
+### 新增 Anthropic 协议供应商
+
+在 `../config.py` 的 `MODEL_CONFIGS` 中添加配置，并设置 `protocol="anthropic"`：
+
+```python
+"anthropic-claude": ModelConfig(
+    provider_model="claude-sonnet-4-6",
+    base_url="https://api.anthropic.com",
+    api_key_env="ANTHROPIC_API_KEY",
+    protocol="anthropic",
+),
+```
+
+工厂函数 `create_provider()` 会自动选择 `AnthropicProvider`。
+
 ### 新增 Prompt 模板
 
 在 `../config.py` 的 `PROMPT_TEMPLATES` 中注册：
@@ -430,6 +516,12 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | 10 | **指数退避重试** | `min(0.1 * 2^attempt, 5.0)` + jitter + 上限保护 |
 | 11 | **类型安全适配器** | `ProviderResponse` dataclass 替代裸 dict，`is_usage_chunk` 显式标志 |
 | 12 | **`LLMResponse.model` 回填平台名** | 响应返回 `general-primary`，供应商名只保留在审计层 |
+| 13 | **双协议适配器** | BaseProvider 抽象 + OpenAI/Anthropic 双协议，工厂函数自动选择 |
+| 14 | **TTFT 度量** | 流式首个非空 delta 时间记录，写入审计和 SSE 事件 |
+| 15 | **按模型限流 429** | 线程安全滑动窗口，每模型独立锁，非流式走 fallback、流式 pre-flight 429 JSON |
+| 16 | **`GatewayError.http_status` 契约** | 异常携带 HTTP 状态码，`_DEFAULT_STATUS` 映射 + 可显式覆盖，测试钉住防漂移 |
+| 17 | **`GatewayError` 选择性 fallback** | `rate_limited` 切换模型；`structured_output_invalid` 等立即抛出，不浪费 fallback 链 |
+| 18 | **`would_accept()` 公共只读查询** | 限流器暴露公共方法，app 层不直接访问内部字段 |
 
 ## 11. 已知限制（Limitations）
 
@@ -441,3 +533,5 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | 2 | **审计存储为进程内 list** | 多 worker 下不共享，无分页、无鉴权、无 TTL。生产应替换为数据库 + 访问控制 |
 | 3 | **`Message` 不支持 tool/function calling** | 当前 `role` 只有 system/user/assistant，`content` 是 `str`。Agent 场景需要扩展支持 |
 | 4 | **重试 jitter 不可复现** | `random.uniform` 使测试等待时间非确定性。可改为 `random.seed` 或在测试中 patch |
+| 5 | **Anthropic 无原生结构化输出** | Anthropic 协议不支持 `json_schema`/`json_object` 模式，通过 system prompt 注入 Schema 文本引导，可靠性低于原生支持 |
+| 6 | **限流器为进程内存储** | `_ModelRateLimiter` 的窗口数据在进程重启后丢失，多 worker 下不共享。生产应替换为 Redis 等分布式限流 |

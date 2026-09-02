@@ -23,6 +23,7 @@ from gateway import (
     get_traces,
     stream_with_fallback,
     validate_model_chain,
+    validate_rate_limit,
 )
 from models import GatewayError, LLMRequest, LLMResponse
 
@@ -35,9 +36,15 @@ app = FastAPI(title="LLM Gateway", version="1.0.0")
 
 @app.exception_handler(GatewayError)
 async def gateway_error_handler(_request: Request, exc: GatewayError) -> JSONResponse:
-    """统一的 Gateway 业务异常响应。"""
+    """统一的 Gateway 业务异常响应。
+
+    HTTP 状态码由 GatewayError.http_status 控制：
+    - rate_limited → 429
+    - provider_auth_error → 401
+    - 其他业务异常 → 422
+    """
     return JSONResponse(
-        status_code=422,
+        status_code=exc.http_status,
         content={"error_code": exc.error_code, "message": exc.message},
     )
 
@@ -56,14 +63,12 @@ async def chat(request: LLMRequest) -> LLMResponse:
 async def chat_stream(request: LLMRequest) -> StreamingResponse:
     """流式 SSE 调用。
 
-    在返回 StreamingResponse 之前先校验模型白名单，
-    确保错误能被 exception_handler 捕获为 422 JSON。
-    返回 Server-Sent Events：
-    - data: {"type": "content.delta", "delta": "..."}
-    - data: {"type": "response.completed", "model": "...", "usage": {...}}
+    在返回 StreamingResponse 之前执行 pre-flight 检查：
+    1. validate_model_chain() — 白名单校验 → 422 JSON
+    2. validate_rate_limit() — 限流预检 → 429 JSON
     """
-    # 在返回 StreamingResponse 之前校验，使 GatewayError 能被 exception_handler 捕获
     validate_model_chain(request.model)
+    validate_rate_limit(request.model)
 
     async def event_generator():
         async for event in stream_with_fallback(request):
