@@ -257,9 +257,14 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
     3. 每个模型最多重试 1 次（指数退避）
     4. 可重试异常等待后重试，不可重试异常直接抛出
     5. 全部失败抛出 model_unavailable
+
+    全局时间预算：整个 fallback 链共享 timeout_seconds，
+    单次 provider 调用传 min(timeout_seconds, deadline - now) 真正封顶。
     """
     request_id = new_request_id()
     start_time = time.monotonic()
+    # 全局时间预算：整个 fallback 链共享 timeout_seconds
+    deadline = start_time + request.timeout_seconds
     messages = _apply_prompt(request)
     model_chain = _build_fallback_chain(request.model)
     total_attempts = 0
@@ -276,6 +281,12 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
         provider = create_provider(config)
 
         for attempt in range(MAX_RETRIES_PER_MODEL):
+            # 全局预算检查：剩余时间封顶单次调用
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = TimeoutError("全局时间预算已耗尽")
+                break
+
             total_attempts += 1
             try:
                 # 限流在 try 内：超限 → GatewayError("rate_limited")
@@ -284,8 +295,9 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
 
                 raw: ProviderResponse = await provider.complete(
                     messages=messages,
+                    response_format=request.response_format,
                     response_schema=request.response_schema,
-                    timeout_seconds=request.timeout_seconds,
+                    timeout_seconds=min(request.timeout_seconds, remaining),
                     max_tokens=request.max_tokens,
                 )
 
@@ -378,20 +390,28 @@ async def call_with_fallback(request: LLMRequest) -> LLMResponse:
 async def stream_with_fallback(
     request: LLMRequest,
 ) -> AsyncIterator[dict]:
-    """流式调用，支持主备切换（流开始后不切换）+ 审计。
+    """流式调用，支持主备切换（流开始后不切换）+ 指数退避重试 + 全局时间预算 + 审计。
 
     yield 的 dict 格式：
     - {"type": "content.delta", "delta": "..."}   文本块
     - {"type": "response.completed", "model": "...", "usage": {...}} 完成事件
     - {"type": "error", "error_code": "...", "message": "..."} 错误事件
 
-    注意：限流预检在 app 层 validate_rate_limit() 完成（429 JSON），
+    流首内容前的临时失败（RETRYABLE_EXCEPTIONS）纳入指数退避重试，
+    与 call_with_fallback 保持一致的重试策略。全局时间预算由
+    request.timeout_seconds 控制，跨 fallback 链共享。
+
+    限流预检在 app 层 validate_rate_limit() 完成（429 JSON），
     此处仅做兜底 acquire（确保计数准确）。
     """
     request_id = new_request_id()
     start_time = time.monotonic()
+    # 全局时间预算：整个 fallback 链共享 timeout_seconds
+    deadline = start_time + request.timeout_seconds
     messages = _apply_prompt(request)
     model_chain = _build_fallback_chain(request.model)
+    total_attempts = 0
+    last_error: Exception | None = None
 
     prompt_name = request.prompt.name if request.prompt else None
     prompt_version = request.prompt.version if request.prompt else None
@@ -419,110 +439,139 @@ async def stream_with_fallback(
             # 预检已通过但并发导致超限 → 尝试下一个模型
             continue
 
-        try:
-            async for pr in provider.stream(
-                messages=messages,
-                timeout_seconds=request.timeout_seconds,
-                max_tokens=request.max_tokens,
-            ):
-                if pr.text_delta:
-                    if ttft_ms is None:
-                        ttft_ms = int((time.monotonic() - start_time) * 1000)
-                    emitted = True
-                    yield {
-                        "type": "content.delta",
-                        "delta": pr.text_delta,
-                        "request_id": request_id,
-                    }
-                if pr.is_usage_chunk:
-                    stream_usage = Usage(
-                        input_tokens=pr.input_tokens,
-                        output_tokens=pr.output_tokens,
-                        total_tokens=pr.total_tokens,
-                    )
+        # 每个模型的指数退避重试（仅流首内容前有效）
+        for attempt in range(MAX_RETRIES_PER_MODEL):
+            # 全局预算检查：剩余时间封顶单次调用
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = TimeoutError("全局时间预算已耗尽")
+                break  # 切换到下一个模型
 
-            # 流正常结束
-            latency_ms = int((time.monotonic() - start_time) * 1000)
-            usage = stream_usage or Usage()
-            cost = calculate_cost(
-                config.provider_model, usage.input_tokens, usage.output_tokens
-            )
-            trace = CallTrace(
-                request_id=request_id,
-                requested_model=request.model,
-                actual_model=config.provider_model,
-                prompt_name=prompt_name,
-                prompt_version=prompt_version,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-                ttft_ms=ttft_ms,
-                attempts=1,
-                status="success",
-            )
-            _record_trace(trace)
+            total_attempts += 1
 
-            yield {
-                "type": "response.completed",
-                "model": platform_model,
-                "request_id": request_id,
-                "usage": usage.model_dump(),
-                "ttft_ms": ttft_ms,
-            }
-            return
+            try:
+                async for pr in provider.stream(
+                    messages=messages,
+                    response_format=request.response_format,
+                    response_schema=request.response_schema,
+                    timeout_seconds=min(request.timeout_seconds, remaining),
+                    max_tokens=request.max_tokens,
+                ):
+                    if pr.text_delta:
+                        if ttft_ms is None:
+                            ttft_ms = int((time.monotonic() - start_time) * 1000)
+                        emitted = True
+                        yield {
+                            "type": "content.delta",
+                            "delta": pr.text_delta,
+                            "request_id": request_id,
+                        }
+                    if pr.is_usage_chunk:
+                        stream_usage = Usage(
+                            input_tokens=pr.input_tokens,
+                            output_tokens=pr.output_tokens,
+                            total_tokens=pr.total_tokens,
+                        )
 
-        except RETRYABLE_EXCEPTIONS as e:
-            if emitted:
+                # 流正常结束
                 latency_ms = int((time.monotonic() - start_time) * 1000)
+                usage = stream_usage or Usage()
+                cost = calculate_cost(
+                    config.provider_model, usage.input_tokens, usage.output_tokens
+                )
                 trace = CallTrace(
                     request_id=request_id,
                     requested_model=request.model,
                     actual_model=config.provider_model,
                     prompt_name=prompt_name,
                     prompt_version=prompt_version,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost_usd=cost,
                     latency_ms=latency_ms,
                     ttft_ms=ttft_ms,
-                    attempts=1,
-                    status="error",
-                    error_code="stream_interrupted",
+                    attempts=total_attempts,
+                    status="success",
                 )
                 _record_trace(trace)
+
+                yield {
+                    "type": "response.completed",
+                    "model": platform_model,
+                    "request_id": request_id,
+                    "usage": usage.model_dump(),
+                    "ttft_ms": ttft_ms,
+                }
+                return
+
+            except RETRYABLE_EXCEPTIONS as e:
+                last_error = e
+                if emitted:
+                    # 流已开始，不能切换模型（避免文本断裂）
+                    latency_ms = int((time.monotonic() - start_time) * 1000)
+                    # 补上已收集的 usage（流中断场景下成本统计不为 0）
+                    interrupted_usage = stream_usage or Usage()
+                    cost = calculate_cost(
+                        config.provider_model,
+                        interrupted_usage.input_tokens,
+                        interrupted_usage.output_tokens,
+                    )
+                    trace = CallTrace(
+                        request_id=request_id,
+                        requested_model=request.model,
+                        actual_model=config.provider_model,
+                        prompt_name=prompt_name,
+                        prompt_version=prompt_version,
+                        input_tokens=interrupted_usage.input_tokens,
+                        output_tokens=interrupted_usage.output_tokens,
+                        cost_usd=cost,
+                        latency_ms=latency_ms,
+                        ttft_ms=ttft_ms,
+                        attempts=total_attempts,
+                        status="error",
+                        error_code="stream_interrupted",
+                    )
+                    _record_trace(trace)
+                    yield {
+                        "type": "error",
+                        "error_code": "stream_interrupted",
+                        "message": str(e),
+                        "request_id": request_id,
+                    }
+                    return
+                # 流未开始：指数退避后重试（或切换到下一模型）
+                if attempt < MAX_RETRIES_PER_MODEL - 1:
+                    if time.monotonic() >= deadline:
+                        break  # 预算耗尽，切换模型
+                    await asyncio.sleep(_retry_delay(attempt))
+                continue
+
+            except NON_RETRYABLE_PROVIDER_EXCEPTIONS as e:
                 yield {
                     "type": "error",
-                    "error_code": "stream_interrupted",
+                    "error_code": "provider_auth_error",
                     "message": str(e),
                     "request_id": request_id,
                 }
                 return
-            continue  # 流未开始，尝试下一个模型
 
-        except NON_RETRYABLE_PROVIDER_EXCEPTIONS as e:
-            yield {
-                "type": "error",
-                "error_code": "provider_auth_error",
-                "message": str(e),
-                "request_id": request_id,
-            }
-            return
+            except GatewayError as e:
+                yield {
+                    "type": "error",
+                    "error_code": e.error_code,
+                    "message": e.message,
+                    "request_id": request_id,
+                }
+                return
 
-        except GatewayError as e:
-            yield {
-                "type": "error",
-                "error_code": e.error_code,
-                "message": e.message,
-                "request_id": request_id,
-            }
-            return
-
-        except Exception as e:
-            yield {
-                "type": "error",
-                "error_code": "unknown_error",
-                "message": str(e),
-                "request_id": request_id,
-            }
-            return
+            except Exception as e:
+                yield {
+                    "type": "error",
+                    "error_code": "unknown_error",
+                    "message": str(e),
+                    "request_id": request_id,
+                }
+                return
 
     # 全部模型失败
     latency_ms = int((time.monotonic() - start_time) * 1000)
@@ -533,7 +582,7 @@ async def stream_with_fallback(
         prompt_name=prompt_name,
         prompt_version=prompt_version,
         latency_ms=latency_ms,
-        attempts=0,
+        attempts=total_attempts,
         status="error",
         error_code="model_unavailable",
     )
@@ -541,6 +590,6 @@ async def stream_with_fallback(
     yield {
         "type": "error",
         "error_code": "model_unavailable",
-        "message": "所有模型均不可用",
+        "message": f"所有模型均不可用，最后错误: {last_error}",
         "request_id": request_id,
     }

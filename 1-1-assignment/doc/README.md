@@ -66,7 +66,7 @@ curl -X POST http://localhost:8000/v1/llm \
   }'
 ```
 
-### 结构化输出
+### 结构化输出（response_schema）
 
 ```bash
 curl -X POST http://localhost:8000/v1/llm \
@@ -85,10 +85,37 @@ curl -X POST http://localhost:8000/v1/llm \
   }'
 ```
 
-### 流式调用
+### 结构化输出（response_format，兼容 OpenAI 风格）
 
 ```bash
-curl -X POST http://localhost:8000/v1/llm/stream \
+curl -X POST http://localhost:8000/v1/llm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "general-primary",
+    "messages": [{"role": "user", "content": "分析情感：今天天气真好"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "sentiment",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+            "confidence": {"type": "number"}
+          },
+          "required": ["sentiment", "confidence"]
+        }
+      }
+    }
+  }'
+```
+
+> **注意**：`response_format.type` 仅支持 `json_schema` 和 `json_object`，不支持 `text`（OpenAI 的纯文本模式）。未知 type 将返回 422 错误。
+
+### 流式调用（统一入口 stream=true）
+
+```bash
+curl -X POST http://localhost:8000/v1/llm \
   -H "Content-Type: application/json" \
   -d '{
     "model": "general-primary",
@@ -96,6 +123,8 @@ curl -X POST http://localhost:8000/v1/llm/stream \
     "stream": true
   }'
 ```
+
+> 也可使用兼容别名 `/v1/llm/stream`。
 
 ### Prompt 模板调用
 

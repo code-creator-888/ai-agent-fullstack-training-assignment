@@ -80,7 +80,7 @@ DeepSeek / OpenAI / Anthropic / 其他兼容供应商
 | **适配器层** | `../provider.py` | `BaseProvider` 抽象 + `OpenAICompatibleProvider` + `AnthropicProvider`，工厂函数 `create_provider()` |
 | **网关核心** | `../gateway.py` | 主备切换、重试、结构化校验、审计记录、TTFT 度量、按模型限流 |
 | **API 层** | `../app.py` | FastAPI REST 端点，429 限流响应映射 |
-| **测试** | `../test_gateway.py` | Mock 测试（45 项） + 集成测试 |
+| **测试** | `../test_gateway.py` | Mock 测试（62 项） + 集成测试 |
 
 ## 4. 目录结构
 
@@ -89,13 +89,14 @@ DeepSeek / OpenAI / Anthropic / 其他兼容供应商
 ├── __init__.py
 ├── models.py              # Pydantic 请求/响应模型
 ├── config.py              # 模型白名单、Prompt 模板、价格表
-├── provider.py            # OpenAI 兼容供应商适配器
+├── provider.py            # OpenAI / Anthropic 双协议适配器
 ├── gateway.py             # 核心：主备切换、重试、校验、审计
-├── app.py                 # FastAPI REST API
-├── test_gateway.py        # Mock 测试
+├── app.py                 # FastAPI REST API（统一入口）
+├── test_gateway.py        # Mock 测试（62 项）
 ├── test_gateway_e2e.py    # 集成测试（真实 API）
-├── requirements.txt       # 依赖声明
-└── README.md              # 使用文档
+└── doc/                   # 设计文档
+    ├── 01-design.md
+    └── README.md
 ```
 
 ## 5. 核心设计
@@ -114,11 +115,18 @@ class LLMRequest(BaseModel):
     messages: list[Message]                 # 消息列表
     stream: bool = False                    # 是否流式
     response_schema: dict | None = None     # 结构化输出 JSON Schema
-    timeout_seconds: float = 30             # 超时时间
+    response_format: dict | None = None     # 兼容 OpenAI 风格的 response_format
+    timeout_seconds: float = 30             # 超时时间（全局预算）
+    max_tokens: int | None = None            # 最大输出 Token 数
     prompt: PromptSelection | None = None   # Prompt 模板选择
 ```
 
-**组合校验**（`model_validator`）：`stream=True` 与 `response_schema` 不能同时使用（流式无法做 JSON 校验）。
+**组合校验**（`model_validator`）：
+- `stream=True` 与 `response_schema` 不能同时使用（流式无法做 JSON 校验）
+- `response_format.type` 只允许 `json_schema` / `json_object`（不支持 `text`），未知 type 直接报错
+- `json_schema` 模式必须包含 `schema` 字段，缺失则报错
+- `response_format` 归一化后合并到 `response_schema`，`response_schema` 优先不被覆盖
+- **优先级说明**：当 `response_format` 和 `response_schema` 同时传入时，`response_format.type` 决定 provider 的行为模式（json_object / json_schema），`response_schema` 提供 Schema 内容。validator 层只做单向保护：显式 `response_schema` 不被 `response_format.json_schema.schema` 覆盖
 
 #### 响应 — `LLMResponse`
 
@@ -174,7 +182,7 @@ BaseProvider (ABC)
 
 ##### `complete()` — 非流式
 
-- 支持两种结构化输出模式：
+- 支持两种结构化输出模式（通过 `_negotiate_response_format()` 共享协商逻辑，complete / stream 共用）：
   - `json_schema`：使用 `response_format.type = "json_schema"` + `strict=True`
   - `json_object`：使用 `response_format.type = "json_object"` + 在 system prompt 中注入 Schema
 - 密钥通过 `config.api_key_env` 从环境变量读取，缺失时抛出 `gateway_misconfigured` 错误
@@ -183,6 +191,10 @@ BaseProvider (ABC)
 
 - 逐块读取上游响应，yield `delta.content`
 - **流开始后不再切换备用模型**，避免文本重复或断裂
+- **流首内容前的临时失败纳入指数退避重试**，与非流式保持一致
+- **全局时间预算**：`timeout_seconds` 跨整个 fallback 链共享，单次调用传 `min(timeout, remaining)` 真正封顶
+- **双参数能力协商**：`response_format`（行为类型） + `response_schema`（Schema 内容）同时传给 provider，provider 内部按 mode 归一化，非流式和流式行为一致
+- Anthropic 流式同样支持 Schema 注入到 system prompt
 
 #### AnthropicProvider
 
@@ -237,28 +249,34 @@ for model_name in [requested_model, "general-backup"]:
 ### 5.5 流式代理 (`stream_with_fallback`)
 
 ```
-# app 层先调用 validate_model_chain()，确保 model_not_found 返回 422 JSON
+# app 层先调用 validate_model_chain() + validate_rate_limit()，确保错误返回 JSON
+deadline = start_time + timeout_seconds  # 全局时间预算
 for model_name in [requested_model, "general-backup"]:
-    async for pr in provider.stream(...):
-        if pr.text_delta:
-            emitted = True
-            yield SSE: {"type": "content.delta", "delta": pr.text_delta, "request_id": ...}
-        if pr.is_usage_chunk:    # 显式标志，不依赖 token 数推断
-            stream_usage = Usage(...)
-    # 流正常结束：记录 CallTrace 审计
-    yield SSE: {"type": "response.completed", "model": model_name, "usage": {...}}
-    return
-except:
-    if emitted or not retryable:
-        break    # 已发送部分内容，不再切换
+    for attempt in range(MAX_RETRIES_PER_MODEL):   # 流首前可重试
+        remaining = deadline - now
+        if remaining <= 0: break                    # 预算耗尽，切换模型
+        async for pr in provider.stream(response_format=..., response_schema=..., timeout=min(timeout, remaining)):
+            if pr.text_delta:
+                emitted = True
+                yield SSE: content.delta
+            if pr.is_usage_chunk:
+                stream_usage = Usage(...)
+        → 成功 → yield response.completed + return
+    except retryable:
+        if emitted: break    # 已发送内容，不切换
+        await _retry_delay(attempt)  # 指数退避
     → 尝试备用模型
 ```
 
 **关键**：
 - 流开始后出错不再切换模型，因为已向客户端发送部分内容，切换会导致文本断裂
+- 流首内容前的临时失败纳入指数退避重试，与非流式 `call_with_fallback` 保持一致
+- **全局时间预算**：`timeout_seconds` 跨 fallback 链共享，单次调用传 `min(timeout, deadline - now)` 真正封顶，两条路径语义统一
 - 流式调用同样记录 `CallTrace` 审计（含 token 用量、成本、延迟）
+- `stream_interrupted` 审计补上已收集的 usage，成本统计不为 0
 - `response.completed` 事件携带 `usage` 信息
 - 流式端点在返回 `StreamingResponse` 之前调用 `validate_model_chain()` 校验白名单（确保 422 JSON）和 `validate_rate_limit()` 预检限流（确保 429 JSON），避免 SSE 流内嵌 error 事件
+- **结构化输出能力协商**：`response_format`（携带类型指令） + `response_schema`（携带 Schema 内容）同时传给 provider，provider 内部按 `structured_output_mode` 归一化，两条路径行为一致
 
 ### 5.6 结构化输出校验
 
@@ -343,9 +361,11 @@ PRICE_PER_MILLION = {
 
 | 端点 | 方法 | 功能 |
 |------|------|------|
-| `/v1/llm` | POST | 非流式调用（含结构化输出） |
-| `/v1/llm/stream` | POST | 流式 SSE 调用 |
+| `/v1/llm` | POST | 统一入口（`stream=false` 非流式，`stream=true` 流式 SSE） |
+| `/v1/llm/stream` | POST | 流式 SSE 调用（兼容别名） |
 | `/v1/traces` | GET | 查询调用审计记录 |
+
+> **OpenAPI 双 content type**：`/v1/llm` 的 200 响应在 OpenAPI schema 中显式声明 `application/json`（`$ref` LLMResponse）和 `text/event-stream`（string），确保 Swagger UI 可见两种返回格式。注意 `content` 内层只能用 `{"schema": ...}`，不能用 `{"model": ...}`。
 
 ### 请求示例
 
@@ -392,15 +412,40 @@ curl -X POST http://localhost:8000/v1/llm \
   }'
 ```
 
-**流式调用：**
+**流式调用（统一入口 stream=true）：**
 
 ```bash
-curl -X POST http://localhost:8000/v1/llm/stream \
+curl -X POST http://localhost:8000/v1/llm \
   -H "Content-Type: application/json" \
   -d '{
     "model": "general-primary",
     "messages": [{"role": "user", "content": "讲一个故事"}],
     "stream": true
+  }'
+```
+
+**使用 response_format（兼容 OpenAI 风格）：**
+
+```bash
+curl -X POST http://localhost:8000/v1/llm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "general-primary",
+    "messages": [{"role": "user", "content": "分析情感：今天天气真好"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "sentiment",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+            "confidence": {"type": "number"}
+          },
+          "required": ["sentiment", "confidence"]
+        }
+      }
+    }
   }'
 ```
 
@@ -529,7 +574,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 | # | 限制 | 说明 |
 |---|------|------|
-| 1 | **`timeout_seconds` 是单次语义** | 当前原样传给 provider，fallback 链最坏 2×2×30s=120s，超过调用方理解的 30s。生产级应用改为总预算递减 |
+| 1 | **`timeout_seconds` 是全局预算** | 非流式和流式均使用 deadline 封顶，单次调用传 `min(timeout, remaining)`。最坏总时长 ≤ `timeout_seconds`，不再是 2×2×30s |
 | 2 | **审计存储为进程内 list** | 多 worker 下不共享，无分页、无鉴权、无 TTL。生产应替换为数据库 + 访问控制 |
 | 3 | **`Message` 不支持 tool/function calling** | 当前 `role` 只有 system/user/assistant，`content` 是 `str`。Agent 场景需要扩展支持 |
 | 4 | **重试 jitter 不可复现** | `random.uniform` 使测试等待时间非确定性。可改为 `random.seed` 或在测试中 patch |

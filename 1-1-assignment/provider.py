@@ -101,6 +101,7 @@ class BaseProvider(ABC):
     async def complete(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
         response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
@@ -112,10 +113,19 @@ class BaseProvider(ABC):
     async def stream(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
+        response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderResponse]:
-        """流式调用，逐块 yield ProviderResponse。"""
+        """流式调用，逐块 yield ProviderResponse。
+
+        Args:
+            response_format: 原始响应格式指令（json_object / json_schema），
+                             携带行为类型信息，流式路径的核心调度依据。
+            response_schema: 从 response_format 提取或显式设置的 JSON Schema，
+                             仅在 json_schema 模式或非流式路径下有值。
+        """
         ...
 
 
@@ -142,11 +152,16 @@ class OpenAICompatibleProvider(BaseProvider):
     async def complete(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
         response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
     ) -> ProviderResponse:
         """非流式调用，返回类型安全的 ProviderResponse。
+
+        双参数驱动（与 stream() 一致）：
+        - response_format 携带行为类型（json_object / json_schema）
+        - response_schema 携带实际的 Schema 内容
 
         支持两种结构化输出模式：
         - json_schema: response_format.type = "json_schema" + strict=True
@@ -167,31 +182,8 @@ class OpenAICompatibleProvider(BaseProvider):
         if max_tokens and max_tokens > 0:
             kwargs["max_tokens"] = resolved_max
 
-        # 结构化输出处理
-        if response_schema is not None:
-            if self.config.supports_structured_output:
-                if self.config.structured_output_mode == "json_schema":
-                    kwargs["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "response",
-                            "strict": True,
-                            "schema": response_schema,
-                        },
-                    }
-                elif self.config.structured_output_mode == "json_object":
-                    kwargs["response_format"] = {"type": "json_object"}
-                    schema_text = (
-                        f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
-                        f"{json.dumps(response_schema, ensure_ascii=False)}"
-                    )
-                    self._inject_schema_to_system(api_messages, schema_text)
-            else:
-                schema_text = (
-                    f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
-                    f"{json.dumps(response_schema, ensure_ascii=False)}"
-                )
-                self._inject_schema_to_system(api_messages, schema_text)
+        # 结构化输出处理（双参数驱动，complete / stream 共用）
+        self._negotiate_response_format(kwargs, api_messages, response_format, response_schema)
 
         response = await client.chat.completions.create(**kwargs)
 
@@ -207,20 +199,37 @@ class OpenAICompatibleProvider(BaseProvider):
     async def stream(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
+        response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderResponse]:
-        """流式调用，逐块 yield ProviderResponse。"""
+        """流式调用，复用 complete() 的能力协商逻辑。
+
+        双参数驱动：
+        - response_format 携带行为类型（json_object / json_schema）
+        - response_schema 携带实际的 Schema 内容
+
+        模式协商（与 complete() 一致）：
+        - json_object: 传 response_format.type=json_object + 有 schema 时 system 注入
+        - json_schema: 按 config.structured_output_mode 归一化
+        - 不支持时: system 注入 Schema 降级
+        """
         client = self._get_client()
         api_messages = [{"role": m.role.value, "content": m.content} for m in messages]
 
-        stream = await client.chat.completions.create(
-            model=self._resolve_model(),
-            messages=api_messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            timeout=timeout_seconds,
-        )
+        kwargs: dict = {
+            "model": self._resolve_model(),
+            "messages": api_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "timeout": timeout_seconds,
+        }
+
+        # 结构化输出处理（双参数驱动，complete / stream 共用）
+        self._negotiate_response_format(kwargs, api_messages, response_format, response_schema)
+
+        stream = await client.chat.completions.create(**kwargs)
 
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
@@ -247,6 +256,59 @@ class OpenAICompatibleProvider(BaseProvider):
                 return
         messages.insert(0, {"role": "system", "content": schema_text.strip()})
 
+    def _negotiate_response_format(
+        self,
+        kwargs: dict,
+        messages: list[dict],
+        response_format: dict | None,
+        response_schema: dict | None,
+    ) -> None:
+        """结构化输出能力协商（complete / stream 共用）。
+
+        双参数驱动：
+        - response_format 携带行为类型（json_object / json_schema）
+        - response_schema 携带实际的 Schema 内容
+
+        根据 config.structured_output_mode 和 config.supports_structured_output
+        决定传给上游的 response_format 以及是否在 system 中注入 Schema。
+        """
+        fmt_type = response_format.get("type") if response_format else None
+
+        if fmt_type == "json_object":
+            kwargs["response_format"] = {"type": "json_object"}
+            if response_schema is not None:
+                schema_text = (
+                    f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
+                    f"{json.dumps(response_schema, ensure_ascii=False)}"
+                )
+                self._inject_schema_to_system(messages, schema_text)
+        elif fmt_type == "json_schema" or response_schema is not None:
+            if self.config.supports_structured_output:
+                if self.config.structured_output_mode == "json_schema" and response_schema:
+                    kwargs["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "response",
+                            "strict": True,
+                            "schema": response_schema,
+                        },
+                    }
+                else:
+                    kwargs["response_format"] = {"type": "json_object"}
+                    if response_schema is not None:
+                        schema_text = (
+                            f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
+                            f"{json.dumps(response_schema, ensure_ascii=False)}"
+                        )
+                        self._inject_schema_to_system(messages, schema_text)
+            else:
+                if response_schema is not None:
+                    schema_text = (
+                        f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
+                        f"{json.dumps(response_schema, ensure_ascii=False)}"
+                    )
+                    self._inject_schema_to_system(messages, schema_text)
+
 
 # ──────────────────────────────────────────────
 # Anthropic Messages 协议适配器
@@ -265,6 +327,30 @@ class AnthropicProvider(BaseProvider):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self._client: anthropic.AsyncAnthropic | None = None
+
+    @staticmethod
+    def _inject_schema_to_system_text(
+        system_text: str,
+        response_format: dict | None,
+        response_schema: dict | None,
+    ) -> str:
+        """结构化输出：注入 Schema / JSON 提示到 system_text（complete / stream 共用）。
+
+        Anthropic 无原生结构化输出模式，通过在 system prompt 中注入文本引导模型。
+        双参数驱动：response_schema 有值时注入完整 Schema，仅有 response_format 时注入 JSON 提示。
+        """
+        if response_schema is not None:
+            schema_text = (
+                f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
+                f"{json.dumps(response_schema, ensure_ascii=False)}"
+            )
+            return (system_text + schema_text) if system_text else schema_text.strip()
+        if response_format is not None and response_format.get("type") in (
+            "json_schema", "json_object",
+        ):
+            hint = "\n\n你必须返回一个 JSON 对象。"
+            return (system_text + hint) if system_text else hint.strip()
+        return system_text
 
     def _get_client(self) -> anthropic.AsyncAnthropic:
         """懒加载 AsyncAnthropic 客户端。"""
@@ -312,6 +398,7 @@ class AnthropicProvider(BaseProvider):
     async def complete(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
         response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
@@ -324,13 +411,10 @@ class AnthropicProvider(BaseProvider):
         client = self._get_client()
         system_text, api_messages = self._split_system_messages(messages)
 
-        # 结构化输出：注入 Schema 到 system prompt
-        if response_schema is not None:
-            schema_text = (
-                f"\n\n你必须返回符合以下 JSON Schema 的 JSON 对象：\n"
-                f"{json.dumps(response_schema, ensure_ascii=False)}"
-            )
-            system_text = (system_text + schema_text) if system_text else schema_text.strip()
+        # 结构化输出：注入 Schema 到 system prompt（complete / stream 共用）
+        system_text = self._inject_schema_to_system_text(
+            system_text, response_format, response_schema,
+        )
 
         resolved_max = self._resolve_max_tokens(max_tokens)
         kwargs: dict = {
@@ -358,6 +442,8 @@ class AnthropicProvider(BaseProvider):
     async def stream(
         self,
         messages: list[Message],
+        response_format: dict | None = None,
+        response_schema: dict | None = None,
         timeout_seconds: float = 30,
         max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderResponse]:
@@ -366,9 +452,15 @@ class AnthropicProvider(BaseProvider):
         使用 client.messages.stream() 高级接口：
         - event.type == "text"  → text_delta
         - 流结束后通过 get_final_message() 获取 usage
+        - 结构化输出：与 complete() 一致，注入 Schema 到 system prompt
         """
         client = self._get_client()
         system_text, api_messages = self._split_system_messages(messages)
+
+        # 结构化输出：注入 Schema 到 system prompt（complete / stream 共用）
+        system_text = self._inject_schema_to_system_text(
+            system_text, response_format, response_schema,
+        )
 
         resolved_max = self._resolve_max_tokens(max_tokens)
         kwargs: dict = {

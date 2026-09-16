@@ -59,6 +59,10 @@ class PromptSelection(BaseModel):
 # 请求 / 响应
 # ──────────────────────────────────────────────
 
+#: response_format.type 允许的取值（仅支持 JSON 格式，不支持 text）
+ALLOWED_RESPONSE_FORMAT_TYPES: frozenset[str] = frozenset({"json_schema", "json_object"})
+
+
 class LLMRequest(BaseModel):
     """统一的 LLM 调用请求。"""
     model_config = ConfigDict(extra="forbid")
@@ -67,9 +71,39 @@ class LLMRequest(BaseModel):
     messages: list[Message]                 # 消息列表
     stream: bool = False                    # 是否流式
     response_schema: Optional[dict] = None  # 结构化输出 JSON Schema
+    response_format: Optional[dict] = None  # 兼容 OpenAI 风格的 response_format
     timeout_seconds: float = 30             # 超时时间
     max_tokens: Optional[int] = None         # 最大输出 Token 数（None 使用模型配置默认值）
     prompt: Optional[PromptSelection] = None  # Prompt 模板选择
+
+    @model_validator(mode="after")
+    def _normalize_response_format(self) -> "LLMRequest":
+        """归一化 response_format 到 response_schema，并严格校验。
+
+        - 未知 type → ValueError（拼错 type 是高频错误，不静默放过）
+        - json_schema 缺 schema → ValueError（约束失效无意义）
+        - json_object 无显式 schema → 由供应商自行约束
+        - response_schema 已显式设置时不被 response_format 覆盖
+        """
+        if self.response_format is not None:
+            fmt_type = self.response_format.get("type")
+            if fmt_type not in ALLOWED_RESPONSE_FORMAT_TYPES:
+                raise ValueError(
+                    f"response_format.type 必须是 "
+                    f"{sorted(ALLOWED_RESPONSE_FORMAT_TYPES)} 之一，"
+                    f"收到: {fmt_type!r}"
+                )
+            if fmt_type == "json_schema" and self.response_schema is None:
+                js = self.response_format.get("json_schema", {})
+                schema = js.get("schema")
+                if schema is None:
+                    raise ValueError(
+                        "response_format.type=json_schema 时 "
+                        "json_schema.schema 不能缺失"
+                    )
+                self.response_schema = schema
+            # json_object 模式无显式 schema，由供应商自行约束
+        return self
 
     @model_validator(mode="after")
     def _check_stream_and_schema(self) -> "LLMRequest":

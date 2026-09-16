@@ -58,6 +58,7 @@ skip_no_anthropic_key = pytest.mark.skipif(
 def make_e2e_request(
     content: str = "用一句话介绍Python",
     response_schema: dict | None = None,
+    response_format: dict | None = None,
     prompt: PromptSelection | None = None,
     stream: bool = False,
 ) -> LLMRequest:
@@ -65,6 +66,7 @@ def make_e2e_request(
         model="general-primary",
         messages=[Message(role=Role.USER, content=content)],
         response_schema=response_schema,
+        response_format=response_format,
         prompt=prompt,
         stream=stream,
     )

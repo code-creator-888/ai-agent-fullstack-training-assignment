@@ -54,8 +54,10 @@ def make_request(
     content: str = "你好",
     stream: bool = False,
     response_schema: dict | None = None,
+    response_format: dict | None = None,
     prompt: PromptSelection | None = None,
     messages: list[Message] | None = None,
+    timeout_seconds: float = 30,
 ) -> LLMRequest:
     """快速构造一个测试请求。"""
     if messages is None:
@@ -65,7 +67,9 @@ def make_request(
         messages=messages,
         stream=stream,
         response_schema=response_schema,
+        response_format=response_format,
         prompt=prompt,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -121,6 +125,65 @@ class TestModelValidation:
         """无效角色应被拒绝。"""
         with pytest.raises(Exception):
             Message(role="invalid_role", content="hi")
+
+    def test_response_format_json_schema_extraction(self):
+        """response_format 类型为 json_schema 时应提取 schema 到 response_schema。"""
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="hi")],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "strict": True, "schema": schema},
+            },
+        )
+        assert req.response_schema == schema
+        assert req.response_format is not None
+
+    def test_response_format_json_object_no_schema(self):
+        """response_format 类型为 json_object 时不提取 schema（无显式 schema）。"""
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="hi")],
+            response_format={"type": "json_object"},
+        )
+        assert req.response_schema is None
+
+    def test_response_schema_takes_precedence(self):
+        """response_schema 已设置时不被 response_format 覆盖。"""
+        schema_a = {"type": "object", "properties": {"a": {"type": "string"}}}
+        schema_b = {"type": "object", "properties": {"b": {"type": "string"}}}
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="hi")],
+            response_schema=schema_a,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "resp", "schema": schema_b},
+            },
+        )
+        assert req.response_schema == schema_a  # 未被覆盖
+
+    def test_response_format_unknown_type_rejected(self):
+        """未知 response_format.type 应被拒绝（拼错 type 是高频错误）。"""
+        with pytest.raises(Exception, match="response_format.type"):
+            LLMRequest(
+                model="general-primary",
+                messages=[Message(role=Role.USER, content="hi")],
+                response_format={"type": "bogus_type"},
+            )
+
+    def test_response_format_json_schema_missing_schema_rejected(self):
+        """json_schema 模式缺少 schema 字段应被拒绝。"""
+        with pytest.raises(Exception, match="json_schema.schema"):
+            LLMRequest(
+                model="general-primary",
+                messages=[Message(role=Role.USER, content="hi")],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "resp"},  # 缺少 schema
+                },
+            )
 
 
 # ──────────────────────────────────────────────
@@ -334,7 +397,7 @@ class TestGatewayLogic:
             model="gpt-4o-mini",
         )
 
-        async def mock_complete(messages, response_schema=None, timeout_seconds=30, max_tokens=None):
+        async def mock_complete(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
             nonlocal call_count
             call_count += 1
             # 前 2 次调用（主模型）超时，后面（备用模型）正常返回
@@ -428,7 +491,7 @@ class TestStreaming:
 
         _traces.clear()
 
-        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
             # 模拟文本块
             for chunk in ["你好", "！", "我是", "AI", "助手。"]:
                 yield ProviderResponse(
@@ -624,7 +687,7 @@ class TestTTFT:
 
         _traces.clear()
 
-        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
             await asyncio.sleep(0.05)  # 模拟首 Token 延迟
             yield ProviderResponse(text_delta="你好", model="deepseek-chat")
             yield ProviderResponse(text_delta="世界", model="deepseek-chat")
@@ -651,7 +714,7 @@ class TestTTFT:
         """response.completed SSE 事件应包含 ttft_ms。"""
         from gateway import stream_with_fallback
 
-        async def fake_stream(messages, timeout_seconds=30, max_tokens=None):
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
             yield ProviderResponse(text_delta="A", model="m")
             yield ProviderResponse(
                 text_delta="", model="m",
@@ -888,6 +951,402 @@ class TestHTTPStatusContract:
         await limiter.acquire("wa-test", 2)
         # 现在满了
         assert limiter.would_accept("wa-test", 2) is False
+
+
+# ──────────────────────────────────────────────
+# 测试：流式重试（指数退避 + 全局预算）
+# ──────────────────────────────────────────────
+
+class TestStreamRetry:
+    """流式首内容前临时失败的指数退避重试测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_retry_before_emit(self):
+        """流首内容前可重试异常应触发指数退避重试。"""
+        from gateway import stream_with_fallback, _traces
+        from openai import APITimeoutError
+
+        _traces.clear()
+        call_count = 0
+
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 1:
+                # 第一次尝试失败（流未开始）
+                raise APITimeoutError(request=None)
+            # 第二次尝试成功
+            yield ProviderResponse(text_delta="重试成功", model="deepseek-chat")
+            yield ProviderResponse(
+                text_delta="", model="deepseek-chat",
+                input_tokens=5, output_tokens=3, total_tokens=8,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            # 应该成功
+            completed = [e for e in events if e["type"] == "response.completed"]
+            assert len(completed) == 1
+            # 应重试：调用次数 > 1
+            assert call_count == 2
+            # 审计记录应记录 attempts > 1
+            assert len(_traces) == 1
+            assert _traces[0].attempts >= 2
+
+    @pytest.mark.asyncio
+    async def test_stream_no_retry_after_emit(self):
+        """流已开始后不应重试，直接返回 stream_interrupted。"""
+        from gateway import stream_with_fallback, _traces
+        from openai import APIConnectionError
+
+        _traces.clear()
+
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            # 先发一些内容
+            yield ProviderResponse(text_delta="已开始", model="deepseek-chat")
+            # 然后失败
+            raise APIConnectionError(request=None)
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            error_events = [e for e in events if e["type"] == "error"]
+            assert len(error_events) == 1
+            assert error_events[0]["error_code"] == "stream_interrupted"
+
+    @pytest.mark.asyncio
+    async def test_stream_global_budget_timeout(self):
+        """全局时间预算耗尽时应切换到下一个模型或返回失败。"""
+        from gateway import stream_with_fallback, _traces
+        from openai import APITimeoutError
+
+        _traces.clear()
+
+        async def always_timeout(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            raise APITimeoutError(request=None)
+            yield  # pragma: no cover — 使其成为 async generator
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=always_timeout,
+        ):
+            # 用极短的超时确保全局预算快速耗尽
+            req = make_request(timeout_seconds=0.3)
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            error_events = [e for e in events if e["type"] == "error"]
+            assert len(error_events) >= 1
+            # 最终应该是 model_unavailable
+            last_error = error_events[-1]
+            assert last_error["error_code"] == "model_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_stream_attempts_tracked_in_trace(self):
+        """流式审计记录应正确跟踪 attempts 计数。"""
+        from gateway import stream_with_fallback, _traces
+        from openai import APITimeoutError
+
+        _traces.clear()
+        call_count = 0
+
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise APITimeoutError(request=None)
+            # 第三次成功（主模型重试1次 + 备用模型第1次）
+            yield ProviderResponse(text_delta="成功", model="gpt-4o-mini")
+            yield ProviderResponse(
+                text_delta="", model="gpt-4o-mini",
+                input_tokens=3, output_tokens=2, total_tokens=5,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            completed = [e for e in events if e["type"] == "response.completed"]
+            assert len(completed) == 1
+            # 审计应记录正确的 attempts
+            assert len(_traces) == 1
+            assert _traces[0].attempts == 3
+
+
+# ──────────────────────────────────────────────
+# 测试：统一端点 stream=true
+# ──────────────────────────────────────────────
+
+class TestUnifiedEndpoint:
+    """统一 /v1/llm 端点测试。"""
+
+    def test_response_format_field_accepted(self):
+        """响应格式字段应被接受。"""
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="hi")],
+            response_format={"type": "json_object"},
+        )
+        assert req.response_format == {"type": "json_object"}
+        # json_object 无显式 schema，不提取到 response_schema；
+        # 但 response_format 原样保留，供 provider 层做模式协商
+        assert req.response_schema is None
+        assert req.response_format == {"type": "json_object"}
+
+    def test_stream_true_with_response_format_json_object(self):
+        """stream=True + response_format={type:json_object} 应允许。
+
+        response_format 原样透传给 provider，不经过 response_schema 提取。
+        """
+        req = LLMRequest(
+            model="general-primary",
+            messages=[Message(role=Role.USER, content="hi")],
+            stream=True,
+            response_format={"type": "json_object"},
+        )
+        assert req.stream is True
+        assert req.response_schema is None
+        # 关键：response_format 保留，provider 可据此做 json_object 协商
+        assert req.response_format == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_post_v1_llm_non_stream(self):
+        """POST /v1/llm stream=false 应返回 LLMResponse JSON。"""
+        from fastapi.testclient import TestClient
+        from app import app as fastapi_app
+        from gateway import _traces
+
+        _traces.clear()
+        fake_resp = make_fake_response()
+
+        with patch(
+            "provider.OpenAICompatibleProvider.complete",
+            new_callable=AsyncMock,
+            return_value=fake_resp,
+        ):
+            client = TestClient(fastapi_app)
+            resp = client.post("/v1/llm", json={
+                "model": "general-primary",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["content"] == "你好！我是AI助手。"
+            assert data["model"] == "general-primary"
+            assert "request_id" in data
+
+    @pytest.mark.asyncio
+    async def test_post_v1_llm_stream_true_sse(self):
+        """POST /v1/llm stream=true 应返回 text/event-stream。"""
+        from fastapi.testclient import TestClient
+        from app import app as fastapi_app
+
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            yield ProviderResponse(text_delta="你好", model="deepseek-chat")
+            yield ProviderResponse(
+                text_delta="", model="deepseek-chat",
+                input_tokens=5, output_tokens=3, total_tokens=8,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            client = TestClient(fastapi_app)
+            resp = client.post("/v1/llm", json={
+                "model": "general-primary",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            })
+            assert resp.status_code == 200
+            assert "text/event-stream" in resp.headers.get("content-type", "")
+            # 解析 SSE 事件
+            lines = [l for l in resp.text.split("\n") if l.startswith("data:")]
+            assert len(lines) >= 2  # 至少 content.delta + response.completed
+            # 第一个事件应该是 content.delta
+            first_event = json.loads(lines[0].replace("data: ", ""))
+            assert first_event["type"] == "content.delta"
+            assert first_event["delta"] == "你好"
+
+
+# ──────────────────────────────────────────────
+# 测试：stream_interrupted usage 审计
+# ──────────────────────────────────────────────
+
+class TestStreamInterruptedUsage:
+    """流中断场景下 usage 审计完整性测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupted_trace_has_usage(self):
+        """stream_interrupted 审计应包含已收集的 usage。"""
+        from gateway import stream_with_fallback, _traces
+        from openai import APIConnectionError
+
+        _traces.clear()
+
+        async def fake_stream(messages, response_format=None, response_schema=None, timeout_seconds=30, max_tokens=None):
+            # 先发一些内容
+            yield ProviderResponse(text_delta="已开始", model="deepseek-chat")
+            # 发 usage
+            yield ProviderResponse(
+                text_delta="", model="deepseek-chat",
+                input_tokens=10, output_tokens=5, total_tokens=15,
+                is_usage_chunk=True,
+            )
+            # 然后失败
+            raise APIConnectionError(request=None)
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = make_request()
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            # 审计记录应包含已收集的 usage
+            assert len(_traces) == 1
+            trace = _traces[0]
+            assert trace.error_code == "stream_interrupted"
+            assert trace.input_tokens == 10
+            assert trace.output_tokens == 5
+            assert trace.cost_usd > 0
+
+
+# ──────────────────────────────────────────────
+# 回归测试：N1 / N2（流式结构化输出 + json_object 模式）
+# ──────────────────────────────────────────────
+
+class TestStreamStructuredRegression:
+    """N1/N2 回归测试：验证 response_format 和 response_schema 正确透传到 provider。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_json_object_passes_response_format(self):
+        """N1: stream=True + json_object 应将 response_format 透传给 provider。
+
+        之前只传 response_schema（恒为 None），导致约束完全丢失。
+        现在同时传 response_format，provider 据此做 json_object 协商。
+        """
+        from gateway import stream_with_fallback
+
+        captured_format = None
+
+        async def fake_stream(messages, response_format=None, response_schema=None,
+                              timeout_seconds=30, max_tokens=None):
+            nonlocal captured_format
+            captured_format = response_format
+            yield ProviderResponse(text_delta="ok", model="deepseek-chat")
+            yield ProviderResponse(
+                text_delta="", model="deepseek-chat",
+                input_tokens=3, output_tokens=1, total_tokens=4,
+                is_usage_chunk=True,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.stream",
+            side_effect=fake_stream,
+        ):
+            req = LLMRequest(
+                model="general-primary",
+                messages=[Message(role=Role.USER, content="hi")],
+                stream=True,
+                response_format={"type": "json_object"},
+            )
+            events = []
+            async for event in stream_with_fallback(req):
+                events.append(event)
+
+            # N1 核心断言：provider 收到了 response_format
+            assert captured_format == {"type": "json_object"}
+            # response_schema 应为 None（json_object 不提取 schema）
+            completed = [e for e in events if e["type"] == "response.completed"]
+            assert len(completed) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_stream_json_object_passes_response_format(self):
+        """N2: 非流式 json_object 也应将 response_format 传给 provider stream。
+
+        json_object 是 general-primary 的配置模式（config.py:41），
+        必须确保 provider 收到响应格式指令而不是仅靠 response_schema is None 推断。
+        """
+        from gateway import call_with_fallback
+
+        captured_format = None
+
+        async def fake_complete(messages, response_format=None, response_schema=None,
+                                timeout_seconds=30, max_tokens=None):
+            nonlocal captured_format
+            captured_format = response_format
+            return ProviderResponse(
+                content='{"ok": true}', model="deepseek-chat",
+                input_tokens=5, output_tokens=3, total_tokens=8,
+            )
+
+        with patch(
+            "provider.OpenAICompatibleProvider.complete",
+            side_effect=fake_complete,
+        ):
+            req = LLMRequest(
+                model="general-primary",
+                messages=[Message(role=Role.USER, content="hi")],
+                response_format={"type": "json_object"},
+            )
+            resp = await call_with_fallback(req)
+            # N2 核心断言：provider 收到了 response_format
+            assert captured_format == {"type": "json_object"}
+
+
+# ──────────────────────────────────────────────
+# 守卫测试：OpenAPI schema 可生成
+# ──────────────────────────────────────────────
+
+class TestOpenAPISchemaGuard:
+    """守卫：确保 OpenAPI schema 能正常生成。
+
+    防止 responses 写法错误导致 /openapi.json 500，
+    进而让 Swagger UI / ReDoc 完全不可用。
+    """
+
+    def test_openapi_json_generates(self):
+        """GET /openapi.json 必须返回 200，不能有序列化错误。"""
+        from fastapi.testclient import TestClient
+        from app import app as fastapi_app
+
+        client = TestClient(fastapi_app)
+        resp = client.get("/openapi.json")
+        assert resp.status_code == 200
+        schema = resp.json()
+        # 基本结构完整性
+        assert "paths" in schema
+        assert "/v1/llm" in schema["paths"]
+        # 200 响应应包含双 content type
+        llm_200 = schema["paths"]["/v1/llm"]["post"]["responses"]["200"]
+        content_types = llm_200.get("content", {})
+        assert "application/json" in content_types
+        assert "text/event-stream" in content_types
 
 
 if __name__ == "__main__":

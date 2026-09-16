@@ -1,8 +1,8 @@
 """FastAPI REST API：LLM Gateway 的 HTTP 入口。
 
 端点：
-  POST /v1/llm         — 非流式调用（含结构化输出）
-  POST /v1/llm/stream   — 流式 SSE 调用
+  POST /v1/llm         — 统一调用（stream=true 时返回 SSE）
+  POST /v1/llm/stream   — 流式 SSE 调用（兼容别名）
   GET  /v1/traces        — 查询调用审计记录
 """
 
@@ -53,20 +53,48 @@ async def gateway_error_handler(_request: Request, exc: GatewayError) -> JSONRes
 # REST 端点
 # ──────────────────────────────────────────────
 
-@app.post("/v1/llm", response_model=LLMResponse)
-async def chat(request: LLMRequest) -> LLMResponse:
-    """非流式调用（含结构化输出）。"""
+@app.post(
+    "/v1/llm",
+    response_model=LLMResponse,
+    responses={
+        200: {
+            "description": "非流式 LLMResponse JSON / 流式 text/event-stream",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/LLMResponse"},
+                },
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                    "example": 'data: {"type": "content.delta", ...}\n\n',
+                },
+            },
+        },
+    },
+)
+async def chat(request: LLMRequest):
+    """统一调用入口：根据 stream 字段自动分流。
+
+    - stream=false → 非流式调用，返回 LLMResponse JSON
+    - stream=true  → 流式 SSE 调用，返回 StreamingResponse
+    """
+    if request.stream:
+        return await _stream_response(request)
     return await call_with_fallback(request)
 
 
 @app.post("/v1/llm/stream")
 async def chat_stream(request: LLMRequest) -> StreamingResponse:
-    """流式 SSE 调用。
+    """流式 SSE 调用（兼容别名，等同于 stream=true）。
 
     在返回 StreamingResponse 之前执行 pre-flight 检查：
     1. validate_model_chain() — 白名单校验 → 422 JSON
     2. validate_rate_limit() — 限流预检 → 429 JSON
     """
+    return await _stream_response(request)
+
+
+async def _stream_response(request: LLMRequest) -> StreamingResponse:
+    """构建流式 SSE 响应（含 pre-flight 检查）。"""
     validate_model_chain(request.model)
     validate_rate_limit(request.model)
 
