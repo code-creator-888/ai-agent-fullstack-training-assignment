@@ -122,6 +122,13 @@ grep -rn "def fake_\|def mock_\|def always_" <作业目录>/
 自增语句必须在预算检查**之后**——曾出现"预算耗尽 break 但仍计一次"导致审计虚高。
 **验证方法：数 fake 被调用的次数，必须与记录的计数严格相等。**
 
+**规则**：读取模块级可变状态（计数器、字典）必须**经模块引用**（`import m; m.COUNTER`），
+不用 `from m import COUNTER`——int/str 等不可变类型导入即**快照**，
+被导入侧的 `global` 自增永远不反映到导入方。
+**反例（1-2 真实发生）**：demo 用 `from transfer import TRANSFER_EXECUTIONS` 打印副作用统计，
+显示 `0` 而非 `2`；同批的 `TRANSFERS` 是 dict（共享引用）恰好正确，两处并排更具迷惑性。
+测试与 demo 一律 `m.COUNTER` 读取。
+
 **规则**：审计/计量记录（token、成本、耗时）必须与实际一致。
 **异常路径（如流中断）也要带上已收集的数据**，不能让统计归零。
 

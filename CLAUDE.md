@@ -1,5 +1,6 @@
 @AGENTS.md
 @1-1-assignment/AGENTS.md
+@1-2-assignment/AGENTS.md
 
 # Claude Code
 
@@ -7,8 +8,9 @@
 
 - `AGENTS.md`（根）— 跨作业通用规则
 - `1-1-assignment/AGENTS.md` — 1-1 作业专属（命令、文件地图、该作业的坑）
+- `1-2-assignment/AGENTS.md` — 1-2 作业专属（命令、文件地图、竞态两态结论、变异自检要求）
 
-上面两行导入已把两者载入。**只改对应的 `AGENTS.md`，不要在本文件里重复维护规则。**
+上面几行导入已把三者载入。**只改对应的 `AGENTS.md`，不要在本文件里重复维护规则。**
 新增作业时，在此追加一行 `@<新目录>/AGENTS.md`。
 
 ## Claude 专属补充
